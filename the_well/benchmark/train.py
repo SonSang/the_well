@@ -38,8 +38,14 @@ def train(
     local_rank: int = 1,
 ):
     """Instantiate the different objects required for training and run the training loop."""
+    is_tawm = (cfg.model._target_ == 'the_well.benchmark.models.UNetConvNextTAWM')
+
     validation_mode = cfg.validation_mode
     logger.info(f"Instantiate datamodule {cfg.data._target_}")
+    if is_tawm:
+        cfg.data.n_steps_output = 5
+        logger.info(f"Setting n_steps_output to {cfg.data.n_steps_output} for TAWM")
+        
     datamodule: WellDataModule = instantiate(
         cfg.data, world_size=world_size, rank=rank, data_workers=cfg.data_workers
     )
@@ -62,7 +68,7 @@ def train(
         dim_out=n_output_fields,
     )
     summary(model, depth=5)
-
+    
     if is_distributed:
         torch.cuda.set_device(local_rank)
         device = torch.device("cuda")
@@ -109,6 +115,7 @@ def train(
         lr_scheduler=lr_scheduler,
         device=device,
         is_distributed=is_distributed,
+        is_tawm=is_tawm,
     )
     if validation_mode:
         trainer.validate()

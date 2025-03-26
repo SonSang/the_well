@@ -98,3 +98,5 @@ outputs/
 wandb/
 datasets/rt_experimental
 check_well_data_4059043.out
+
+.vscode/

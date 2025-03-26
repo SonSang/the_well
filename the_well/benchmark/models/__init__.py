@@ -6,6 +6,7 @@ from .refno import ReFNO
 from .tfno import TFNO
 from .unet_classic import UNetClassic
 from .unet_convnext import UNetConvNext
+from .unet_convnext_tawm import UNetConvNextTAWM
 
 __all__ = [
     "FNO",
@@ -16,4 +17,5 @@ __all__ = [
     "ReFNO",
     "AViT",
     "AFNO",
+    "UNetConvNextTAWM",
 ]

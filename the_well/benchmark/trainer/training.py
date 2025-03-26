@@ -61,6 +61,7 @@ class Trainer:
         enable_amp: bool = False,
         amp_type: str = "float16",  # bfloat not supported in FFT
         checkpoint_path: str = "",
+        is_tawm: bool = False,
     ):
         """
         Class in charge of the training loop. It performs train, validation and test.
@@ -145,6 +146,8 @@ class Trainer:
         if len(checkpoint_path) > 0:
             self.load_checkpoint(checkpoint_path)
 
+        self.is_tawm = is_tawm
+
     def save_model(self, epoch: int, validation_loss: float, output_path: str):
         """Save the model checkpoint."""
         torch.save(
@@ -172,9 +175,23 @@ class Trainer:
             checkpoint["epoch"] + 1
         )  # Saves after training loop, so start at next epoch
 
-    def rollout_model(self, model, batch, formatter):
+    def rollout_model(self, model, batch, formatter, is_validation=False, is_long_rollout=False):
         """Rollout the model for as many steps as we have data for."""
         inputs, y_ref = formatter.process_input(batch)
+
+        ### if tawm, select one particular timestep
+        if self.is_tawm:
+            B, Tout, H, W, D = y_ref.shape
+            if not is_long_rollout:
+                if is_validation:
+                    dt = 0
+                else:
+                    dt = np.random.randint(0, Tout)
+                y_ref = y_ref[:, [dt], :, :, :]
+            else:
+                # if long rollout, we do not have to select one particular step
+                pass
+
         rollout_steps = min(
             y_ref.shape[1], self.max_rollout_steps
         )  # Number of timesteps in target
@@ -187,18 +204,55 @@ class Trainer:
                 self.device
             )
         y_preds = []
-        for i in range(rollout_steps):
-            inputs, _ = formatter.process_input(moving_batch)
-            inputs = map(lambda x: x.to(self.device), inputs)
-            y_pred = model(*inputs)
-            y_pred = formatter.process_output(y_pred)
-            # If not last step, update moving batch for autoregressive prediction
-            if i != rollout_steps - 1:
-                moving_batch["input_fields"] = torch.cat(
-                    [moving_batch["input_fields"][:, 1:], y_pred], dim=1
-                )
-            y_preds.append(y_pred)
-        y_pred_out = torch.cat(y_preds, dim=1)
+        
+        if not self.is_tawm or (self.is_tawm and not is_long_rollout):
+            for i in range(rollout_steps):
+                inputs, _ = formatter.process_input(moving_batch)
+                inputs = map(lambda x: x.to(self.device), inputs)
+                if self.is_tawm:
+                    inputs = list(inputs)
+                    inputs.append(dt+1)
+                    inputs.append(D)
+                    y_pred = model(*inputs)
+                else:
+                    y_pred = model(*inputs)
+                y_pred = formatter.process_output(y_pred)
+                # If not last step, update moving batch for autoregressive prediction
+                if i != rollout_steps - 1:
+                    moving_batch["input_fields"] = torch.cat(
+                        [moving_batch["input_fields"][:, 1:], y_pred], dim=1
+                    )
+                y_preds.append(y_pred)
+            y_pred_out = torch.cat(y_preds, dim=1)
+        else:
+            # if it is tawm and long rollout, we use power of tawm
+            tawm_window = 5
+            tawm_rollout_steps = (rollout_steps // tawm_window) + 1
+
+            for i in range(tawm_rollout_steps):
+                inputs, _ = formatter.process_input(moving_batch)
+                inputs = map(lambda x: x.to(self.device).clone(), inputs)
+                inputs = list(inputs)
+
+                for j in range(tawm_window):
+                    curr_rollout_step = i * tawm_window + j
+                    if curr_rollout_step >= rollout_steps:
+                        break
+
+                    inputs.append(j+1)
+                    inputs.append(D)
+                    
+                    y_pred = model(*inputs)
+                    y_pred = formatter.process_output(y_pred)
+
+                    inputs = inputs[:-2]        # remove the last two elements
+
+                    moving_batch["input_fields"] = torch.cat(
+                        [moving_batch["input_fields"][:, 1:], y_pred], dim=1
+                    )
+                    y_preds.append(y_pred)
+            y_pred_out = torch.cat(y_preds, dim=1)
+
         y_ref = y_ref.to(self.device)
         return y_pred_out, y_ref
 
@@ -266,7 +320,8 @@ class Trainer:
         ):
             for i, batch in enumerate(tqdm.tqdm(dataloader)):
                 # Rollout for length of target
-                y_pred, y_ref = self.rollout_model(self.model, batch, self.formatter)
+                is_long_rollout = "rollout" in valid_or_test
+                y_pred, y_ref = self.rollout_model(self.model, batch, self.formatter, True, is_long_rollout)
                 assert (
                     y_ref.shape == y_pred.shape
                 ), f"Mismatching shapes between reference {y_ref.shape} and prediction {y_pred.shape}"
@@ -329,7 +384,7 @@ class Trainer:
                 self.device.type, enabled=self.enable_amp, dtype=self.amp_type
             ):
                 batch_time = time.time() - batch_start
-                y_pred, y_ref = self.rollout_model(self.model, batch, self.formatter)
+                y_pred, y_ref = self.rollout_model(self.model, batch, self.formatter, False)
                 forward_time = time.time() - batch_start - batch_time
                 assert (
                     y_ref.shape == y_pred.shape
@@ -471,21 +526,21 @@ class Trainer:
             "epoch": self.max_epoch + 1,
         }
         wandb.log(rollout_val_loss_dict, step=epoch)
-        # Regular test
-        test_loss, test_logs = self.validation_loop(
-            test_dataloader, valid_or_test="test", full=True
-        )
-        logger.info(f"Post run: test loss {test_loss}")
-        # Rollout test
-        rollout_test_loss, rollout_test_logs = self.validation_loop(
-            rollout_test_dataloader, valid_or_test="rollout_test", full=True
-        )
-        test_logs |= rollout_test_logs
-        logger.info(f"Post run: rollout test loss {rollout_test_loss}")
+        # # Regular test
+        # test_loss, test_logs = self.validation_loop(
+        #     test_dataloader, valid_or_test="test", full=True
+        # )
+        # logger.info(f"Post run: test loss {test_loss}")
+        # # Rollout test
+        # rollout_test_loss, rollout_test_logs = self.validation_loop(
+        #     rollout_test_dataloader, valid_or_test="rollout_test", full=True
+        # )
+        # test_logs |= rollout_test_logs
+        # logger.info(f"Post run: rollout test loss {rollout_test_loss}")
 
-        test_logs |= {
-            "test": test_loss,
-            "rollout_test": rollout_test_loss,
-            "epoch": self.max_epoch + 1,
-        }
-        wandb.log(test_logs, step=epoch)
+        # test_logs |= {
+        #     "test": test_loss,
+        #     "rollout_test": rollout_test_loss,
+        #     "epoch": self.max_epoch + 1,
+        # }
+        # wandb.log(test_logs, step=epoch)
